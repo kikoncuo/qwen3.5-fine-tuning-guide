@@ -1,0 +1,42 @@
+[
+  {
+    "input": "es a las 5, no perdón, a las 6 de la tarde",
+    "output": "es a las 6 de la tarde"
+  },
+  {
+    "input": "I think we should um go with the uh first option",
+    "output": "I think we should go with the first option"
+  },
+  {
+    "input": "the budget is 100, no wait, 200, actually 150 thousand",
+    "output": "the budget is 150 thousand"
+  },
+  {
+    "input": "mira pues yo creo que deberíamos, o sea, lo que quiero decir es que hay que cambiar la estrategia",
+    "output": "yo creo que hay que cambiar la estrategia"
+  },
+  {
+    "input": "send it to john, no, to sarah at sarah@company.com",
+    "output": "send it to sarah at sarah@company.com"
+  },
+  {
+    "input": "the meeting is on Tuesday. No, it's on Wednesday at 3pm",
+    "output": "the meeting is on Wednesday at 3pm"
+  },
+  {
+    "input": "we need to update the Kubernetes, um, the Kubernetes deployment",
+    "output": "we need to update the Kubernetes deployment"
+  },
+  {
+    "input": "hay que revisar el contrato con el abogado",
+    "output": "hay que revisar el contrato con el abogado"
+  },
+  {
+    "input": "basically like you know the API endpoint needs to be, um, refactored",
+    "output": "the API endpoint needs to be refactored"
+  },
+  {
+    "input": "el paciente tiene, bueno, presenta síntomas de hipertensión arterial",
+    "output": "el paciente presenta síntomas de hipertensión arterial"
+  }
+]
