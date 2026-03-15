@@ -1,11 +1,39 @@
-# Fine-Tuning Qwen3.5 on Apple Silicon: Text Correction & Screen Context Extraction
+# Fine-Tuning Qwen3.5 on Apple Silicon: Text & Vision
 
-A detailed, reproducible guide for fine-tuning [Qwen3.5](https://huggingface.co/Qwen/Qwen3.5-0.8B) VLM models on Apple Silicon (M-series Macs) for two real-world tasks:
+## The Problem
 
-1. **Text Correction** — Cleaning ASR transcriptions (removing self-corrections, fillers) using `mlx_lm` LoRA
-2. **Screen Context Extraction** — Extracting proper nouns and technical terms from screenshots using `transformers` + PEFT LoRA
+Fine-tuning a model usually means renting cloud GPUs, fighting CUDA drivers, and watching your credit card while a training run crawls through epochs on a machine you don't control. You can spend more time debugging SSH tunnels and OOM errors than actually training.
 
-Both tasks were developed as part of [keysay](https://github.com/kikoncuo/keysay), a macOS press-to-dictate app that uses Qwen3-ASR for speech recognition and Qwen3.5 VLM for post-processing.
+Apple Silicon changes this. The unified memory architecture means your Mac's RAM _is_ your VRAM — there's no data transfer bottleneck between CPU and GPU, no separate GPU memory to overflow. A 16 GB MacBook has 16 GB of usable model memory. With [MLX](https://github.com/ml-explore/mlx), Apple's framework for machine learning on their chips, you can LoRA fine-tune a model in minutes, on your laptop, for free.
+
+## What This Guide Covers
+
+We fine-tuned [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) — a vision-language model small enough to run on any Apple Silicon Mac — for two real tasks inside [keysay](https://github.com/kikoncuo/keysay), a macOS press-to-dictate app:
+
+**Text correction** — A user dictates "es a las 5, no perdon, a las 6" and the model needs to understand the self-correction and output "es a las 6". The base model can't do this at all (0/12 test cases). After 5 minutes of LoRA training with `mlx_lm`, the fine-tuned model scores 12/12 — outperforming even the Gemini Flash teacher model that generated the training data.
+
+**Screen context extraction** — While the user dictates, the app screenshots their screen and feeds it to the VLM to extract proper nouns, technical terms, and jargon. These context hints help the ASR model recognize words like "Kubernetes" or "Dr. Martinez" that it would otherwise mishear. We generated 206 synthetic screenshots with Gemini, engineered the extraction prompt through 5 iterations (cutting label noise by 50%), and trained with both `mlx-vlm` LoRA and `transformers` + PEFT on MPS.
+
+## The Experiment
+
+We wanted to answer a simple question: **can a 0.8B model learn a specialized skill that it completely fails at out of the box?**
+
+The approach: use a large model (Gemini Flash) as a teacher to generate and validate training data, then distill that knowledge into the tiny model via LoRA. Keep training cheap and local.
+
+```
+Base Qwen3.5-0.8B:  "es a las 5, no perdón, a las 6"  →  "es a las 5, no perdón, a las 6"  (echoes input)
+After 5 min LoRA:   "es a las 5, no perdón, a las 6"  →  "es a las 6"                       (correct)
+```
+
+| | Base model | Fine-tuned | Gemini Flash (teacher) |
+|---|---|---|---|
+| Test accuracy | 0/12 | **12/12** | 11/12 |
+| Training cost | - | $0 (local) | - |
+| Training time | - | 5 minutes | - |
+| Peak RAM | 3 GB | 3.6 GB | API |
+| Inference speed | ~300 tok/s | ~300 tok/s | ~50 tok/s (API) |
+
+The fine-tuned 0.8B model outperforms its own teacher because knowledge distillation with teacher validation creates a perfectly consistent decision boundary — something the teacher itself doesn't always maintain.
 
 ---
 
