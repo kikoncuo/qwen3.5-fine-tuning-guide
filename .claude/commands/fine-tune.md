@@ -241,6 +241,21 @@ prompt = tokenizer.apply_chat_template(messages, tokenize=False,
 
 ### Recipe: VLM fine-tuning with PEFT
 
+**Critical: Qwen3.5 LoRA target modules.** The model is 75% GatedDeltaNet, 25% standard attention. You must target both layer types AND exclude gate projections:
+
+```python
+target_modules=[
+    # Standard attention (25% of layers)
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    # GatedDeltaNet (75% of layers) — EXCLUDE in_proj_a, in_proj_b
+    "in_proj_qkv", "in_proj_z", "out_proj",
+    # MLP (all layers)
+    "gate_proj", "up_proj", "down_proj",
+]
+```
+
+Never include `in_proj_a` or `in_proj_b` — they control the recurrent decay/update gates through a double exponential. LoRA perturbations cause state explosion or amnesia.
+
 ```bash
 # Generate images + labels (parallel, ~10 min)
 python3 scripts/generate_vlm_training_data.py
@@ -252,14 +267,16 @@ python3 scripts/relabel_training_data.py
 # Upload dataset to HuggingFace
 python3 scripts/format_vlm_dataset.py
 
-# Train with PEFT on MPS (~2 hours)
+# Train with PEFT on MPS (~7 hours for 3 epochs)
 python3 scripts/train_vlm_peft.py
 
-# Convert back to MLX
-python3 -m mlx_vlm.convert \
+# Convert back to MLX 8-bit
+python3 -m mlx_vlm convert \
     --hf-path vlm_training/peft-fused \
-    --mlx-path my-vlm-model -q 8
+    --mlx-path my-vlm-model -q --q-bits 8
 ```
+
+Expected results: F1 0.411 (base) → 0.609 (fine-tuned), +48% improvement. Main gain is recall (0.366 → 0.596).
 
 ## Debugging checklist
 
@@ -268,8 +285,10 @@ When training produces garbage output:
 - [ ] Did you apply transformers patches before loading?
 - [ ] Is the adapter directory structured correctly? (`adapters.safetensors` + `adapter_config.json` inside a directory)
 - [ ] Did you sanity-check output on 3 images before full eval?
+- [ ] For PEFT: are `in_proj_a` and `in_proj_b` excluded from target_modules?
+- [ ] For PEFT: does target_modules include both standard attention AND DeltaNet projections?
+- [ ] For PEFT/MPS: is everything float32 with pin_memory disabled?
 - [ ] For mlx-vlm: is `--iters` <= dataset size?
 - [ ] For mlx-vlm: did you avoid `--custom-prompt-format` with Qwen?
-- [ ] For PEFT/MPS: is everything float32 with pin_memory disabled?
 - [ ] Is `enable_thinking=False` set in `apply_chat_template`?
 - [ ] For VLM: is `max-seq-length` large enough (4096) for image tokens + answer?

@@ -293,45 +293,44 @@ High precision, low recall — the model extracts correct terms but misses many.
 
 ### Training: mlx-vlm vs PEFT
 
-We tried two frameworks. One broke, one worked.
+We tried two frameworks. mlx-vlm had three bugs we had to find and fix. PEFT worked and produced the final model.
 
-#### mlx-vlm LoRA (failed)
+#### mlx-vlm LoRA — three bugs found
 
-Three attempts, three failures. All adapters corrupted generation — model outputs only vision tokens:
+Every mlx-vlm training run corrupted generation — the model output only vision tokens. We investigated with 4 parallel agent teams and found three independent bugs:
 
-```
-Expected: "Sarah Chen, PostgreSQL 16, pg_dump..."
-Got:      "<|vision_start|><|image_pad|><|vision_end|>"
-```
+**Bug 1: Images discarded during training.** `VisionDataset.process()` sets `images=None` for Qwen/Gemma/SmolVLM models. Training runs without any image data — only 23 tokens per sample instead of ~1,076.
 
-| Attempt | lr | rank | Result |
-|---|---|---|---|
-| v1 | 1e-5 | 8 | Vision tokens only |
-| v2 | 5e-6 | 4 | Vision tokens only |
-| v3 | 1e-5 | 8 (4096 seq) | Vision tokens only |
+**Bug 2: LoRA scaling 8x too large.** `LoRaLayer` uses raw `alpha` instead of `alpha/rank`. With alpha=16, rank=8: mlx-vlm applies 16x scaling, PEFT applies 2x. The perturbation is 8x larger than intended.
 
-Likely a bug with Qwen3.5's DeltaRNN/linear attention in mlx-vlm v0.4.0.
+**Bug 3: LoRA on DeltaRNN gate projections.** Qwen3.5 is 75% GatedDeltaNet layers. The `in_proj_a` (decay gate) feeds into a double exponential: `g = exp(-exp(A_log) * softplus(a))`. Even small LoRA perturbations push the gate from ~0.95 to 1.0 (state explosion) or 0.5 (amnesia). No normalization layer between the projection and the gate. Additionally, `in_proj_a` has output dim=16 — with rank=8, LoRA covers half the output space.
 
-#### transformers + PEFT on MPS (working)
+We filed [issue #824](https://github.com/Blaizzy/mlx-vlm/issues/824) and [PR #823](https://github.com/Blaizzy/mlx-vlm/pull/823) with fixes for all three bugs. With all fixes applied, mlx-vlm training produces non-corrupted output for ~1 epoch but degrades beyond that. The DeltaNet recurrence amplifies perturbations across the sequence — a fundamental architectural sensitivity.
 
-Switched to PyTorch with Metal Performance Shaders:
+#### transformers + PEFT on MPS (final approach)
+
+PEFT gives control over which modules get LoRA. Qwen3.5's hybrid architecture has two layer types with different module names:
+
+| Standard attention (25% of layers) | GatedDeltaNet (75% of layers) |
+|---|---|
+| `q_proj`, `k_proj`, `v_proj`, `o_proj` | `in_proj_qkv`, `in_proj_z`, `out_proj` |
+
+We target both, plus MLP layers, but exclude the gate projections (`in_proj_a`, `in_proj_b`):
 
 ```python
-from peft import LoraConfig, get_peft_model, TaskType
-
-model = AutoModelForImageTextToText.from_pretrained(
-    "Qwen/Qwen3.5-0.8B",
-    torch_dtype=torch.float32,  # MPS requires float32
-)
-
 lora_config = LoraConfig(
     r=8, lora_alpha=16, lora_dropout=0.05,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"],
+    target_modules=[
+        # Standard attention (25% of layers)
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        # GatedDeltaNet (75% of layers) — exclude in_proj_a, in_proj_b
+        "in_proj_qkv", "in_proj_z", "out_proj",
+        # MLP (all layers)
+        "gate_proj", "up_proj", "down_proj",
+    ],
     task_type=TaskType.CAUSAL_LM,
 )
-model = get_peft_model(model, lora_config)
-# trainable: 3.2M / 856M = 0.37%
+# trainable: 5.4M / 856M = 0.63%
 ```
 
 **MPS-specific settings:**
@@ -348,7 +347,7 @@ TrainingArguments(
 )
 ```
 
-~60s/step, ~2 hours for 156 steps.
+3 epochs, ~7 hours on MPS. Loss: 1.1 → 0.85.
 
 **Label masking** — only train on the assistant response:
 
@@ -356,6 +355,28 @@ TrainingArguments(
 # Find <|im_start|>assistant and mask everything before it
 labels[i, :assistant_start] = -100
 ```
+
+### Results
+
+| Metric | Base model | Fine-tuned | Change |
+|---|---|---|---|
+| **Precision** | 0.677 | **0.731** | +8% |
+| **Recall** | 0.366 | **0.596** | +63% |
+| **F1** | 0.411 | **0.609** | **+48%** |
+
+Per-category F1:
+
+| Category | Base | Fine-tuned | Change |
+|---|---|---|---|
+| corporate_email | 0.475 | **0.693** | +46% |
+| chat_apps | 0.436 | **0.659** | +51% |
+| mixed | 0.427 | **0.626** | +47% |
+| browsers | 0.429 | **0.607** | +41% |
+| documents | 0.440 | **0.573** | +30% |
+| spreadsheets | 0.349 | **0.566** | +62% |
+| code_editors | 0.321 | **0.538** | +68% |
+
+The main gain is recall — the model now captures 60% of ground truth terms instead of 37%. Code editors and spreadsheets saw the biggest improvements.
 
 ### Convert to MLX
 
@@ -366,15 +387,14 @@ merged.save_pretrained("vlm_training/peft-fused")
 ```
 
 ```bash
-# Convert + quantize
-python3 -m mlx_vlm.convert \
+# Convert + quantize to 8-bit MLX
+python3 -m mlx_vlm convert \
     --hf-path vlm_training/peft-fused \
-    --mlx-path keysay-vlm-context-0.8B-8bit -q 8
-
-# Upload
-huggingface-cli upload Enriqueag26/keysay-vlm-context-0.8B-8bit \
-    keysay-vlm-context-0.8B-8bit
+    --mlx-path keysay-vlm-context-0.8B-8bit \
+    -q --q-bits 8
 ```
+
+Final model: 1.2 GB, ~1s per screenshot on Apple Silicon. Same speed as the base model.
 
 ---
 
@@ -386,23 +406,28 @@ huggingface-cli upload Enriqueag26/keysay-vlm-context-0.8B-8bit \
 
 **mlx_lm for text LoRA** — 5 min training, 3.6 GB peak, 300 tok/s inference. Hard to beat for text-only fine-tuning on Mac.
 
+**PEFT for VLM LoRA** — Full control over target modules. Essential for Qwen3.5's hybrid architecture where some projections are unsafe to adapt.
+
 **Parallel data generation** — 6 workers, 21 img/min vs 5/min sequential. Always parallelize API calls.
 
-**Prompt engineering first** — 5 rounds of prompt refinement: F1 0.350 → 0.411. Bigger gain than any model change.
+**Prompt engineering first** — 5 rounds of prompt refinement: F1 0.350 → 0.411. A bigger gain than many training runs.
+
+**Agent-team debugging** — 4 parallel investigation agents found the root causes in ~5 minutes. One analyzed source code, one searched GitHub issues, one researched DeltaRNN architecture, one inspected adapter weights.
 
 ### What didn't work
 
-**mlx-vlm LoRA on Qwen3.5** — All attempts corrupted generation. Bug in mlx-vlm v0.4.0 with DeltaRNN architecture.
+**mlx-vlm LoRA on Qwen3.5** — Three bugs: images discarded, 8x scaling error, DeltaRNN gate instability. We fixed all three and [submitted upstream](https://github.com/Blaizzy/mlx-vlm/pull/823), but the architecture is fundamentally sensitive to LoRA perturbations beyond 1 epoch.
 
-**Small max-seq-length for VLM** — 512 tokens gets consumed by image tokens. Only 23 answer tokens trained per step. Model learns nothing.
+**Standard LoRA target modules on hybrid architectures** — If you target only `q_proj`/`k_proj`/`v_proj`, you adapt only 25% of Qwen3.5's attention layers. The other 75% (GatedDeltaNet) use `in_proj_qkv`, `in_proj_z`, `out_proj`. And you must exclude the gate projections (`in_proj_a`, `in_proj_b`) or the recurrent state diverges.
 
 ### Takeaways
 
 - **Start with the prompt.** Our prompt improvement alone was worth +17% F1.
 - **Teacher validation > raw generation.** Same prompt at training and inference = no distribution mismatch.
 - **Small models beat large ones on narrow tasks.** 0.8B gets 12/12 where Gemini gets 11/12.
-- **When one framework fails, try another.** mlx-vlm broke; PEFT on MPS worked.
-- **Sanity-check adapter output immediately.** Would have saved hours of broken evals.
+- **Know your architecture.** Qwen3.5's DeltaRNN layers need different LoRA targets than standard transformers. Check `model.named_modules()` before training.
+- **When one framework fails, try another.** mlx-vlm broke; PEFT on MPS worked. Same model, same task, different LoRA implementations.
+- **Sanity-check adapter output on 3 examples before running full benchmarks.**
 
 ---
 
@@ -411,10 +436,12 @@ huggingface-cli upload Enriqueag26/keysay-vlm-context-0.8B-8bit \
 | Resource | Link |
 |---|---|
 | Fine-tuned text model | [`Enriqueag26/keysay-transcription-cleaner-0.8B-8bit`](https://huggingface.co/Enriqueag26/keysay-transcription-cleaner-0.8B-8bit) |
-| VLM context model | [`Enriqueag26/keysay-vlm-context-0.8B-8bit`](https://huggingface.co/Enriqueag26/keysay-vlm-context-0.8B-8bit) (pending) |
+| Fine-tuned VLM | [`Enriqueag26/keysay-vlm-context-0.8B-8bit`](https://huggingface.co/Enriqueag26/keysay-vlm-context-0.8B-8bit) |
 | VLM training dataset | [`Enriqueag26/keysay-vlm-context-training`](https://huggingface.co/datasets/Enriqueag26/keysay-vlm-context-training) |
 | Base model | [`Qwen/Qwen3.5-0.8B`](https://huggingface.co/Qwen/Qwen3.5-0.8B) |
 | Base model (MLX 8-bit) | [`mlx-community/Qwen3.5-0.8B-8bit`](https://huggingface.co/mlx-community/Qwen3.5-0.8B-8bit) |
+| mlx-vlm bug report | [Issue #824](https://github.com/Blaizzy/mlx-vlm/issues/824) |
+| mlx-vlm fixes PR | [PR #823](https://github.com/Blaizzy/mlx-vlm/pull/823) |
 
 ---
 
